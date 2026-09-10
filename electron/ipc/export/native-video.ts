@@ -21,6 +21,8 @@ import type {
 import {
 	buildEditedTrackSourceAudioFilter,
 	buildNativeConcatArgs,
+	buildNativeCpuOverlayStaticLayoutArgs,
+	buildNativeCpuPrecompositedStaticLayoutArgs,
 	buildNativeCudaOverlayStaticLayoutArgs,
 	buildNativeCudaScaleCpuPadStaticLayoutArgs,
 	buildNativePrecompositedStaticLayoutArgs,
@@ -3635,13 +3637,27 @@ export async function exportNativeStaticLayoutVideo(
 				throw new Error(getFfmpegFailureMessage(backgroundResult));
 			}
 
+			const usesCpuStaticLayout = process.platform !== "win32" && process.platform !== "linux";
+			const precompositedEncoder = usesCpuStaticLayout
+				? await resolveNativeVideoEncoder(ffmpegPath, options.encodingMode)
+				: undefined;
+
 			const fullResult = await runFfmpegWithMetrics(
 				ffmpegPath,
-				buildNativePrecompositedStaticLayoutArgs({
-					...fullConfig,
-					staticBackgroundPath,
-					maskPath,
-				}),
+				precompositedEncoder
+					? buildNativeCpuPrecompositedStaticLayoutArgs(
+							{
+								...fullConfig,
+								staticBackgroundPath,
+								maskPath,
+							},
+							precompositedEncoder,
+						)
+					: buildNativePrecompositedStaticLayoutArgs({
+							...fullConfig,
+							staticBackgroundPath,
+							maskPath,
+						}),
 				15 * 60 * 1000,
 				session,
 			);
@@ -3657,21 +3673,28 @@ export async function exportNativeStaticLayoutVideo(
 				index: 0,
 				startSec: 0,
 				durationSec: options.durationSec,
-				backend: "cuda-static-composite",
+				backend: precompositedEncoder ? "cpu-static-composite" : "cuda-static-composite",
 				elapsedMs: fullResult.elapsedMs,
 				outputBytes: outputStat.size,
 			});
 		} else if (!didRenderVideo) {
+			const usesCpuStaticLayout = process.platform !== "win32" && process.platform !== "linux";
+			const overlayEncoder = usesCpuStaticLayout
+				? await resolveNativeVideoEncoder(ffmpegPath, options.encodingMode)
+				: undefined;
+
 			const primaryResult = await runFfmpegWithMetrics(
 				ffmpegPath,
-				buildNativeCudaOverlayStaticLayoutArgs(fullConfig),
+				overlayEncoder
+					? buildNativeCpuOverlayStaticLayoutArgs(fullConfig, overlayEncoder)
+					: buildNativeCudaOverlayStaticLayoutArgs(fullConfig),
 				15 * 60 * 1000,
 				session,
 			);
 			let fullResult = primaryResult;
-			let fullBackend: NativeStaticLayoutBackend = "cuda-overlay";
+			let fullBackend: NativeStaticLayoutBackend = overlayEncoder ? "cpu-overlay" : "cuda-overlay";
 			let fallbackReason: string | undefined;
-			if (!primaryResult.success) {
+			if (!primaryResult.success && !overlayEncoder) {
 				fullBackend = "cuda-scale-cpu-pad";
 				fallbackReason = isNativeCudaOutOfMemory(primaryResult.stderr)
 					? "cuda-oom"

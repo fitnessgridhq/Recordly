@@ -77,7 +77,9 @@ export type NativeStaticLayoutBackend =
 	| "cuda-scale-cpu-pad"
 	| "cuda-static-composite"
 	| "nvidia-cuda-compositor"
-	| "windows-d3d11-compositor";
+	| "windows-d3d11-compositor"
+	| "cpu-overlay"
+	| "cpu-static-composite";
 
 export interface NativeStaticLayoutExportArgsConfig {
 	inputPath: string;
@@ -402,6 +404,50 @@ export function buildNativeCudaScaleCpuPadStaticLayoutArgs(
 	return args;
 }
 
+/**
+ * Non-CUDA static layout overlay. Same output shape as
+ * buildNativeCudaOverlayStaticLayoutArgs but uses plain `scale`/`overlay`
+ * filters (no `_cuda` variants, no `-hwaccel cuda`) so it runs on any
+ * platform, including macOS where CUDA/NVENC are unavailable. Pass the
+ * caller's resolved encoder (e.g. "h264_videotoolbox" on macOS,
+ * "libx264" as universal fallback).
+ */
+export function buildNativeCpuOverlayStaticLayoutArgs(
+	config: NativeStaticLayoutExportArgsConfig,
+	encoder: string,
+): string[] {
+	const backgroundColor = formatFfmpegColor(config.backgroundColor);
+	const durationSec = formatFfmpegSeconds(Math.max(0.001, config.durationSec ?? 1) * 1000);
+	const args = ["-y", "-hide_banner", "-loglevel", "error"];
+	pushFfmpegTimeSliceArgs(args, config.startSec, config.durationSec);
+	args.push(
+		"-i",
+		config.inputPath,
+		"-filter_complex",
+		`color=c=${backgroundColor}:s=${config.width}x${config.height}:r=${config.frameRate}:d=${durationSec},format=rgba[bg];[0:v]scale=w=${config.contentWidth}:h=${config.contentHeight},${FFMPEG_AUTO_TO_VIDEO_RANGE_FILTER},fps=${config.frameRate},format=rgba[fg];[bg][fg]overlay=${config.offsetX}:${config.offsetY}:shortest=0:repeatlast=1:eof_action=repeat,trim=duration=${durationSec},setpts=PTS-STARTPTS[out]`,
+		"-map",
+		"[out]",
+		"-an",
+		"-r",
+		String(config.frameRate),
+		"-c:v",
+		encoder,
+	);
+	if (encoder === "libx264") {
+		args.push(...getLibx264ModeArgs(config.encodingMode));
+	}
+	args.push(
+		...getBitrateArgs(config.bitrate),
+		"-pix_fmt",
+		"yuv420p",
+		...FFMPEG_BT709_VIDEO_COLOR_ARGS,
+		"-movflags",
+		"+faststart",
+		config.outputPath,
+	);
+	return args;
+}
+
 export function buildNativeStaticBackgroundRenderArgs(
 	config: NativeStaticLayoutExportArgsConfig,
 ): string[] {
@@ -554,6 +600,82 @@ export function buildNativePrecompositedStaticLayoutArgs(
 		"-c:v",
 		"h264_nvenc",
 		...getNvencStaticLayoutModeArgs(config.encodingMode),
+		...getBitrateArgs(config.bitrate),
+		"-pix_fmt",
+		"yuv420p",
+		...FFMPEG_BT709_VIDEO_COLOR_ARGS,
+		"-movflags",
+		"+faststart",
+		config.outputPath,
+	);
+	return args;
+}
+
+/**
+ * Non-CUDA precomposited static layout. Same output shape as
+ * buildNativePrecompositedStaticLayoutArgs but drops `-hwaccel cuda` and
+ * `scale_cuda` in favor of plain `scale` so it works on platforms without
+ * CUDA (macOS, non-NVIDIA Linux). Pass the caller's resolved encoder
+ * (e.g. "h264_videotoolbox" on macOS, "libx264" as universal fallback).
+ */
+export function buildNativeCpuPrecompositedStaticLayoutArgs(
+	config: NativeStaticLayoutExportArgsConfig,
+	encoder: string,
+): string[] {
+	if (!config.staticBackgroundPath) {
+		throw new Error("Native precomposited static layout requires a static background path");
+	}
+
+	const durationSec = formatFfmpegSeconds(Math.max(0.001, config.durationSec ?? 1) * 1000);
+	const useMask = Boolean(config.maskPath && (config.borderRadius ?? 0) > 0.5);
+	const args = ["-y", "-hide_banner", "-loglevel", "error"];
+	pushFfmpegTimeSliceArgs(args, config.startSec, config.durationSec);
+	args.push(
+		"-i",
+		config.inputPath,
+		"-loop",
+		"1",
+		"-framerate",
+		String(config.frameRate),
+		"-t",
+		durationSec,
+		"-i",
+		config.staticBackgroundPath,
+	);
+
+	if (useMask && config.maskPath) {
+		args.push(
+			"-loop",
+			"1",
+			"-framerate",
+			String(config.frameRate),
+			"-t",
+			durationSec,
+			"-i",
+			config.maskPath,
+		);
+	}
+
+	const foregroundFilter = `[0:v]scale=w=${config.contentWidth}:h=${config.contentHeight},${FFMPEG_AUTO_TO_FULL_RANGE_FILTER},fps=${config.frameRate},format=rgba[fgbase]`;
+	const maskFilter = useMask ? ";[2:v]format=gray[mask];[fgbase][mask]alphamerge[fg]" : "";
+	const foregroundLabel = useMask ? "fg" : "fgbase";
+	const filterComplex = `${foregroundFilter}${maskFilter};[1:v]format=rgba[bg];[bg][${foregroundLabel}]overlay=x=${config.offsetX}:y=${config.offsetY}:format=auto,trim=duration=${durationSec},setpts=PTS-STARTPTS,${FFMPEG_FULL_TO_VIDEO_RANGE_FILTER},format=yuv420p[out]`;
+
+	args.push(
+		"-filter_complex",
+		filterComplex,
+		"-map",
+		"[out]",
+		"-an",
+		"-r",
+		String(config.frameRate),
+		"-c:v",
+		encoder,
+	);
+	if (encoder === "libx264") {
+		args.push(...getLibx264ModeArgs(config.encodingMode));
+	}
+	args.push(
 		...getBitrateArgs(config.bitrate),
 		"-pix_fmt",
 		"yuv420p",
